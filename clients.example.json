@@ -1,0 +1,8 @@
+[
+  {
+    "id": "minha-ia",
+    "name": "Minha IA CLI",
+    "command": ["meu-cliente", "--prompt", "{prompt}", "--output", "{output}"],
+    "note": "Exemplo: ajuste o executável e os parâmetros; a saída deve ser uma imagem."
+  }
+]

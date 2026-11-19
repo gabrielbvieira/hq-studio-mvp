@@ -1,0 +1,827 @@
+diff --git a/src/browser/playwright-cli.ts b/src/browser/playwright-cli.ts
+index e68144a..e9fafa5 100644
+--- a/src/browser/playwright-cli.ts
++++ b/src/browser/playwright-cli.ts
+@@ -1,7 +1,7 @@
+ import { spawn } from "node:child_process";
+ import { createRequire } from "node:module";
+ import path from "node:path";
+-import { readFileSync } from "node:fs";
++import { appendFileSync, readFileSync } from "node:fs";
+ import type { BrowserOptions, CliExecutionResult } from "../types.js";
+ 
+ interface PlaywrightPackageJson {
+@@ -55,6 +55,24 @@ function parseJsonOutput(stdout: string): unknown {
+   }
+ }
+ 
++// Opcional: com CHATGPT_IMAGE_TIMING_LOG, registra quanto cada passo no navegador levou (sem o conteúdo do pedido).
++function logTiming(args: string[], elapsedMs: number, exitCode: number | null): void {
++  const file = process.env.CHATGPT_IMAGE_TIMING_LOG;
++  if (!file) return;
++  const step = args.filter((arg) => !arg.startsWith("-s=")).slice(0, 1).join(" ");
++  const source = step === "run-code" ? (args.includes("--filename") ? "setInputFiles" : args.find((arg) => arg.includes("async page")) ?? "") : "";
++  // Nome do script pelo trecho que só ele tem; o código (com o pedido) nunca vai para o registro.
++  const script = !source ? "" : source.includes("setInputFiles") ? "upload-referencias"
++    : source.includes("composer.fill") ? "enviar-texto" : source.includes("loginRequired") ? "ler-pagina"
++    : source.includes("download") ? "baixar-imagem" : "outro";
++  const detail = script || args.filter((arg) => /^https?:/.test(arg)).join(" ");
++  try {
++    appendFileSync(file, `${new Date().toISOString()}\t${elapsedMs}ms\t${step}${detail ? " " + detail : ""}\texit=${exitCode}\n`);
++  } catch {
++    // O registro de tempo nunca pode atrapalhar a geração.
++  }
++}
++
+ export class PlaywrightCli {
+   private readonly cliPath = resolvePlaywrightCli();
+ 
+@@ -65,6 +83,7 @@ export class PlaywrightCli {
+     options: { timeoutMs?: number; allowFailure?: boolean } = {},
+   ): Promise<CliExecutionResult> {
+     const timeoutMs = options.timeoutMs ?? 30_000;
++    const startedAt = Date.now();
+     return await new Promise<CliExecutionResult>((resolve, reject) => {
+       const child = spawn(process.execPath, [this.cliPath, ...args], {
+         cwd: this.cwd,
+@@ -86,6 +105,7 @@ export class PlaywrightCli {
+       child.on("error", reject);
+       child.on("close", (code) => {
+         clearTimeout(timeout);
++        logTiming(args, Date.now() - startedAt, code);
+         const result: CliExecutionResult = {
+           exitCode: code ?? (timedOut ? 124 : 1),
+           stdout,
+@@ -142,6 +162,23 @@ export class PlaywrightCli {
+     return outer?.result as T;
+   }
+ 
++  /** Igual a runCode, mas lendo o código de um arquivo: sem o limite de tamanho de um argumento. */
++  async runCodeFile<T>(sessionName: string, filename: string, timeoutMs = 30_000): Promise<T> {
++    const execution = await this.execute(
++      [`-s=${sessionName}`, "run-code", "--filename", filename, "--json"],
++      { timeoutMs },
++    );
++    const outer = execution.json as { result?: unknown } | undefined;
++    if (typeof outer?.result === "string") {
++      try {
++        return JSON.parse(outer.result) as T;
++      } catch {
++        return outer.result as T;
++      }
++    }
++    return outer?.result as T;
++  }
++
+   async tabs(sessionName: string): Promise<BrowserTabInfo[]> {
+     const execution = await this.execute([`-s=${sessionName}`, "tab-list", "--json"]);
+     const text = String((execution.json as { result?: string } | undefined)?.result ?? "");
+diff --git a/src/browser/scripts.ts b/src/browser/scripts.ts
+index d40307c..ae0ff6b 100644
+--- a/src/browser/scripts.ts
++++ b/src/browser/scripts.ts
+@@ -11,92 +11,34 @@ function literal(value: unknown): string {
+ }
+ 
+ export function collectPageStateScript(): string {
+-  const workedForPatternSource = literal(WORKED_FOR_PATTERN_SOURCE);
+   return `async page => {
+     await page.waitForLoadState('domcontentloaded').catch(() => {});
+-    // Generated images are lazy-loaded. Merely reading naturalWidth leaves an
+-    // off-screen result at 0x0 forever, so reveal the newest assistant image
+-    // before collecting readiness state.
+-    const generatedImages = page.locator('section[data-turn="assistant"] img');
+-    const generatedImageCount = await generatedImages.count();
+-    if (generatedImageCount > 0) {
+-      await generatedImages.nth(generatedImageCount - 1)
+-        .evaluate(element => element.scrollIntoView({ block: 'center', inline: 'nearest' }))
+-        .catch(() => {});
+-      await page.waitForTimeout(200);
+-    }
++    const preview = page.getByTestId('generated-image-preview');
++    if (await preview.count()) await preview.last().scrollIntoViewIfNeeded().catch(() => {});
+     return await page.evaluate(() => {
+-      const url = location.href;
+-      const bodyText = (document.body?.innerText || '').slice(0, 200000);
++      const root = document.querySelector('main') || document.body;
+       const normalize = value => (value || '').replace(/\\s+/g, ' ').trim();
+-      const workedForPattern = new RegExp(${workedForPatternSource}, 'i');
+-      const turnElements = Array.from(document.querySelectorAll('section[data-turn][data-turn-id]'));
+-      const turns = turnElements.map(section => {
+-        const sources = new Map();
+-        if (section.getAttribute('data-turn') === 'assistant') {
+-          for (const image of Array.from(section.querySelectorAll('img'))) {
+-            const src = image.currentSrc || image.src || '';
+-            if (!src || (!src.includes('/backend-api/estuary/content') && !/generated image|已生成图片/i.test(image.alt || ''))) continue;
+-            const existing = sources.get(src);
+-            const candidate = {
+-              src,
+-              alt: image.alt || '',
+-              complete: Boolean(image.complete),
+-              naturalWidth: Number(image.naturalWidth || 0),
+-              naturalHeight: Number(image.naturalHeight || 0),
+-            };
+-            if (!existing || (!existing.alt && candidate.alt)) sources.set(src, candidate);
+-          }
+-        }
+-        const sectionText = normalize(section.innerText).slice(0, 120000);
+-        const worked = sectionText.match(workedForPattern)?.[0]?.trim();
+-        // Prefer the message body over the whole turn. The latter also contains
+-        // toolbar labels (Edit image, Share this image, and similar controls).
+-        const message = section.querySelector('[data-message-author-role]');
+-        let text = '';
+-        if (message) {
+-          text = normalize(message.innerText).slice(0, 120000);
+-        } else {
+-          const clone = section.cloneNode(true);
+-          for (const control of Array.from(clone.querySelectorAll('button, [role="button"], [role="toolbar"], [data-testid*="action"]'))) {
+-            control.remove();
+-          }
+-          text = normalize(clone.innerText).slice(0, 120000);
+-        }
+-        return {
+-          id: section.getAttribute('data-turn-id') || '',
+-          turn: section.getAttribute('data-turn') || '',
+-          writing: Boolean(section.querySelector('[data-writing-block]')),
+-          text,
+-          workedForText: worked,
+-          images: Array.from(sources.values()),
+-        };
+-      });
+-      const alerts = Array.from(document.querySelectorAll('[role="alert"]'))
+-        .map(element => normalize(element.textContent))
+-        .filter(Boolean)
+-        .slice(0, 20);
+-      const composer = document.querySelector('#prompt-textarea');
+-      const loginRequired = !composer && (
+-        /\\/(auth|login)(\\/|$)/i.test(location.pathname) ||
+-        /log in|sign in|登录|登入/i.test(bodyText.slice(0, 20000))
+-      );
+-      const humanChallenge = /verify you are human|checking your browser|captcha|安全验证|验证您是真人|人机验证/i.test(bodyText.slice(0, 50000)) ||
+-        Boolean(document.querySelector('iframe[src*="captcha"], iframe[src*="challenge"], [data-captcha]'));
+-      const generating = turns.some(turn => turn.writing) || Boolean(document.querySelector(
+-        '[data-testid="stop-button"], button[aria-label*="Stop generating"], button[aria-label*="停止生成"]'
+-      ));
+-      const threadId = location.pathname.match(/^\\/c\\/([^/?#]+)/)?.[1];
+-      return {
+-        url,
+-        title: document.title || '',
+-        threadId,
+-        loginRequired,
+-        humanChallenge,
+-        generating,
+-        alerts,
+-        turns,
+-      };
++      const legacy = Array.from(root.querySelectorAll('section[data-turn][data-turn-id]'));
++      const containers = legacy.length ? legacy : Array.from(root.querySelectorAll('[data-user-message-bubble], [data-response-body]'));
++      const turns = containers.map(element => {
++        const role = element.getAttribute('data-turn') || (element.hasAttribute('data-user-message-bubble') ? 'user' : 'assistant');
++        const id = element.getAttribute('data-turn-id') || element.getAttribute('data-response-body') ||
++                   element.closest('[data-content-search-unit-key]')?.getAttribute('data-content-search-unit-key');
++        const images = role === 'assistant' ? Array.from(element.querySelectorAll('img')).filter(image =>
++          image.closest('[data-testid="generated-image-preview"]') || /generated image|imagem.*gerada|已生成图片/i.test(image.alt || '') ||
++          image.src.includes('/backend-api/estuary/content')).map(image => ({src:image.currentSrc || image.src, alt:image.alt,
++            complete:image.complete, naturalWidth:image.naturalWidth, naturalHeight:image.naturalHeight})) : [];
++        const body = element.querySelector('[data-message-author-role]') || element;
++        return {id, turn:role, text:normalize(body.innerText), writing:Boolean(element.querySelector('[data-writing-block]')), images};
++      }).filter(turn => turn.id);
++      const composer = root.querySelector('#prompt-textarea, [role="textbox"][contenteditable="true"]');
++      const text = normalize(root.innerText).slice(0, 50000);
++      const generating = Array.from(root.querySelectorAll('button')).some(button => button.offsetParent !== null &&
++        /^(Parar|Stop generating|停止生成)$/i.test(button.getAttribute('aria-label') || '')) || turns.some(turn => turn.writing);
++      return {url:location.href, title:document.title, threadId:location.pathname.match(/^\\/c\\/([^/?#]+)/)?.[1], turns,
++        generating, loginRequired:!composer && /log in|sign in|entrar|登录/i.test(text),
++        humanChallenge:/verify you are human|captcha|verifique que você|安全验证/i.test(text),
++        alerts:Array.from(root.querySelectorAll('[role="alert"]')).map(e=>normalize(e.textContent)).filter(Boolean)};
+     });
+   }`;
+ }
+@@ -152,218 +94,105 @@ export function ensureChatModeScript(): string {
+ 
+ export function ensureImageModeScript(): string {
+   return `async page => {
+-    const composer = page.locator('#prompt-textarea');
+-    if (await composer.count() !== 1) throw new Error('LOGIN_REQUIRED:prompt_textarea_missing');
+-    const modeActive = async () => {
+-      const value = (await composer.innerText().catch(() => '')).replace(/\\s+/g, ' ').trim();
+-      if (/创建图片|Create image/i.test(value)) return true;
+-      for (const label of ['浏览灵感', 'Browse inspiration']) {
+-        const heading = page.getByRole('heading', { name: label, exact: true });
+-        if (await heading.count() > 0 && await heading.first().isVisible().catch(() => false)) return true;
+-      }
+-      return false;
+-    };
+-    if (await modeActive()) return { imageMode: true, alreadyActive: true };
+-
+-    // ChatGPT currently exposes a home-page quick action before the plus menu.
+-    // Its pill can be under a continuous layout animation, so a normal
+-    // Playwright click may wait forever for element stability. The locator is
+-    // constrained to one visible button and force only skips that stability
+-    // wait; it does not bypass disabled state or an ambiguous selector.
+-    for (const label of ['生成图片', '创建图片', 'Generate image', 'Create image']) {
+-      const quickAction = page.locator('button').filter({ hasText: label });
+-      if (await quickAction.count() !== 1 || !await quickAction.isVisible().catch(() => false)) continue;
+-      await quickAction.click({ force: true });
+-      await page.waitForTimeout(500);
+-      if (await modeActive()) return { imageMode: true, activatedByQuickAction: true };
+-    }
+-
+-    let plus = page.getByTestId('composer-plus-btn');
+-    if (await plus.count() !== 1) {
+-      plus = page.getByRole('button', { name: '添加文件等', exact: true });
+-    }
+-    if (await plus.count() !== 1) throw new Error('UI_CHANGED:composer_plus_button_missing');
+-    await plus.click({ force: true });
+-    await page.waitForTimeout(400);
+-    if (await modeActive()) return { imageMode: true, activatedByPlus: true };
+-
+-    const labels = ['创建图片', 'Create image'];
+-    let clicked = false;
+-    for (const label of labels) {
+-      const candidates = page.getByText(label, { exact: true });
+-      const count = await candidates.count();
+-      for (let index = 0; index < count; index++) {
+-        const candidate = candidates.nth(index);
+-        if (!await candidate.isVisible().catch(() => false)) continue;
+-        const insideComposer = await candidate.evaluate(element => Boolean(element.closest('#prompt-textarea'))).catch(() => true);
+-        if (insideComposer) continue;
+-        await candidate.click({ force: true });
+-        clicked = true;
+-        break;
+-      }
+-      if (clicked) break;
+-    }
+-    if (!clicked) throw new Error('UI_CHANGED:create_image_menu_item_missing');
+-    await page.waitForTimeout(500);
+-    if (!await modeActive()) throw new Error('UI_CHANGED:create_image_mode_not_activated');
+-    return { imageMode: true, alreadyActive: false };
++    const composer = page.locator('#prompt-textarea, [role="textbox"][contenteditable="true"]').filter({ visible: true });
++    if (await composer.count() !== 1) throw new Error('UI_CHANGED:message_composer_missing');
++    // O pedido já solicita explicitamente a geração. Não depende do nome do atalho de imagens.
++    return { imageMode: true, activatedByPrompt: true };
+   }`;
+ }
+ 
+-export function uploadReferenceImagesScript(referenceImages: string[]): string {
+-  const basenames = referenceImages.map((item) => path.basename(item));
++// O Chrome não deixa a extensão (Playwright Bridge) gravar arquivos locais num <input type=file>:
++// setInputFiles trava e nada é anexado. Por isso os bytes vão dentro do script (lido de arquivo pelo
++// playwright-cli, sem limite de tamanho) e na página viram File, anexados como se a pessoa escolhesse a foto.
++export interface InlineUpload {
++  name: string;
++  type: string;
++  data: string;   // base64
++}
++
++export function attachImagesScript(files: InlineUpload[]): string {
+   return `async page => {
+-    const files = ${literal(referenceImages)};
+-    const basenames = ${literal(basenames)};
++    const files = ${literal(files)};
++    const basenames = files.map(file => file.name);
+     if (!files.length) return { uploaded: 0, observed: true };
+-    let input = page.getByTestId('upload-photos-input');
+-    if (await input.count() !== 1) input = page.locator('#upload-files');
+-    if (await input.count() !== 1) throw new Error('UI_CHANGED:photo_upload_input_missing');
+-    const attachmentSnapshot = async () => page.evaluate(() => {
+-      const composer = document.querySelector('#prompt-textarea');
+-      const root = composer?.closest('form') || composer?.parentElement?.parentElement?.parentElement || document.body;
+-      const candidates = root.querySelectorAll([
+-        '[data-testid*="attachment"]',
+-        '[data-testid*="file-preview"]',
+-        '[data-testid*="upload-preview"]',
+-        'button[aria-label*="Remove"]',
+-        'button[aria-label*="remove"]',
+-        'button[aria-label*="移除"]',
+-        'img[src^="blob:"]'
+-      ].join(','));
+-      return new Set(Array.from(candidates).map(element => {
+-        const container = element.closest('[data-testid*="attachment"], [data-testid*="preview"]') || element;
+-        return [
+-          container.getAttribute('data-testid'),
+-          container.getAttribute('aria-label'),
+-          container.getAttribute('title'),
+-          container.textContent,
+-          container.matches('img') ? container.getAttribute('src') : container.querySelector('img')?.getAttribute('src')
+-        ].filter(Boolean).join('|');
+-      })).size;
+-    });
+-    const attachmentsBefore = await attachmentSnapshot();
+-    await input.setInputFiles(files);
++    const attached = await page.evaluate(files => {
++      const transfer = new DataTransfer();
++      for (const file of files) {
++        const bytes = Uint8Array.from(atob(file.data), char => char.charCodeAt(0));
++        transfer.items.add(new File([bytes], file.name, { type: file.type }));
++      }
++      const inputs = Array.from(document.querySelectorAll('input[type="file"]'));
++      const input = document.querySelector('[data-testid="upload-photos-input"]') ||
++        inputs.find(item => item.accept === 'image/*' && item.multiple) ||
++        inputs.find(item => /image/.test(item.accept) && item.multiple);
++      if (!input) throw new Error('UI_CHANGED:photo_upload_input_missing');
++      const count = transfer.files.length;   // o ChatGPT esvazia o campo depois de ler os arquivos
++      input.files = transfer.files;
++      input.dispatchEvent(new Event('change', { bubbles: true }));
++      return count;
++    }, files);
++    // Só confirma quando CADA foto aparece pelo nome nos anexos da caixa de mensagem (nada de contar imagens soltas).
+     const started = Date.now();
+-    let observed = false;
++    let missing = basenames;
+     while (Date.now() - started < 90000) {
+       const status = await page.evaluate(names => {
+-        const composer = document.querySelector('#prompt-textarea');
+-        const root = composer?.closest('form') || composer?.parentElement?.parentElement?.parentElement || document.body;
+-        const elements = Array.from(root.querySelectorAll('*')).slice(0, 3000);
+-        const haystack = elements.map(element => [
+-          element.getAttribute('alt'),
+-          element.getAttribute('aria-label'),
+-          element.getAttribute('title'),
+-          element.textContent,
++        const composer = document.querySelector('#prompt-textarea, [role="textbox"][contenteditable="true"]');
++        const form = composer?.closest('form');
++        if (!form) return { missing: names, busy: false };
++        const labels = Array.from(form.querySelectorAll('img, [aria-label], [title]')).map(element => [
++          element.getAttribute('alt'), element.getAttribute('aria-label'), element.getAttribute('title'),
+         ].filter(Boolean).join(' ')).join(' ');
+-        const hasAllNames = names.every(name => haystack.includes(name));
+-        const previewCandidates = root.querySelectorAll([
+-          '[data-testid*="attachment"]',
+-          '[data-testid*="file-preview"]',
+-          '[data-testid*="upload-preview"]',
+-          'button[aria-label*="Remove"]',
+-          'button[aria-label*="remove"]',
+-          'button[aria-label*="移除"]',
+-          'img[src^="blob:"]'
+-        ].join(','));
+-        const previewCount = new Set(Array.from(previewCandidates).map(element => {
+-          const container = element.closest('[data-testid*="attachment"], [data-testid*="preview"]') || element;
+-          return [
+-            container.getAttribute('data-testid'),
+-            container.getAttribute('aria-label'),
+-            container.getAttribute('title'),
+-            container.textContent,
+-            container.matches('img') ? container.getAttribute('src') : container.querySelector('img')?.getAttribute('src')
+-          ].filter(Boolean).join('|');
+-        })).size;
+-        const busy = Boolean(root.querySelector('[aria-busy="true"], [data-state="loading"], [data-testid*="uploading"]'));
+-        return { hasAllNames, previewCount, busy };
++        const busy = Boolean(form.querySelector('[aria-busy="true"], [data-state="loading"], [data-testid*="uploading"], [role="progressbar"]'));
++        return { missing: names.filter(name => !labels.includes(name)), busy };
+       }, basenames);
+-      if (!status.busy && (status.hasAllNames || status.previewCount >= attachmentsBefore + files.length)) {
+-        observed = true;
+-        break;
+-      }
++      missing = status.missing;
++      if (!missing.length && !status.busy) return { uploaded: attached, observed: true, ms: Date.now() - started };
+       await page.waitForTimeout(500);
+     }
+-    if (!observed) {
+-      const visibleErrors = await page.locator('[role="alert"]').allTextContents().catch(() => []);
+-      if (visibleErrors.some(text => /upload|上传|failed|失败/i.test(text))) {
+-        throw new Error('UPLOAD_FAILED:' + visibleErrors.join(' | '));
+-      }
+-      throw new Error('UPLOAD_NOT_CONFIRMED:expected_' + files.length + '_reference_images');
++    const visibleErrors = await page.locator('[role="alert"]').allTextContents().catch(() => []);
++    if (visibleErrors.some(text => /upload|enviar|failed|falh|上传|失败/i.test(text))) {
++      throw new Error('UPLOAD_FAILED:' + visibleErrors.join(' | '));
+     }
+-    return { uploaded: files.length, observed: true };
++    throw new Error('UPLOAD_NOT_CONFIRMED:expected_' + files.length + '_reference_images:missing_' + missing.join(','));
+   }`;
+ }
+ 
+ export function submitPromptScript(prompt: string, appendToImageMode: boolean): string {
+   return `async page => {
+-    const prompt = ${literal(prompt)};
+-    const append = ${literal(appendToImageMode)};
+-    const composer = page.locator('#prompt-textarea');
+-    if (await composer.count() !== 1) throw new Error('LOGIN_REQUIRED:prompt_textarea_missing');
+-    if (append) {
+-      const current = (await composer.innerText()).replace(/\\s+/g, ' ').trim();
+-      if (!/创建图片|Create image/i.test(current)) throw new Error('UI_CHANGED:image_mode_marker_missing');
+-      // The image-mode pill is contenteditable=false. A plain click can leave the
+-      // caret before/on the pill, causing insertText() to be silently ignored.
+-      // Focus explicitly and move the caret after the pill before inserting.
+-      await composer.focus();
+-      await composer.press('End');
+-      await page.keyboard.insertText(prompt);
+-    } else {
+-      await composer.fill(prompt);
+-    }
+-    await page.waitForTimeout(200);
+-    const written = (await composer.innerText()).replace(/\\s+/g, ' ').trim();
+-    const expected = prompt.replace(/\\s+/g, ' ').trim();
+-    if (!written.includes(expected)) throw new Error('UI_CHANGED:prompt_text_not_inserted');
+-    const promptWasPosted = async () => {
+-      const turns = page.locator('section[data-turn="user"]');
++    const prompt = ${JSON.stringify(prompt)};
++    const composer = page.locator('#prompt-textarea, [role="textbox"][contenteditable="true"]').filter({ visible: true });
++    if (await composer.count() !== 1) throw new Error('UI_CHANGED:message_composer_missing');
++    const normalize = value => (value || '').replace(/\\s+/g, ' ').trim();
++    const existing = normalize(await composer.innerText());
++    if (existing && existing !== normalize(prompt)) throw new Error('UI_CHANGED:existing_draft_preserved');
++    await composer.fill(prompt);
++    if (!normalize(await composer.innerText()).includes(normalize(prompt))) throw new Error('UI_CHANGED:prompt_text_not_inserted');
++    const accepted = async () => {
++      const turns = page.locator('section[data-turn="user"], [data-user-message-bubble]');
+       const count = await turns.count();
+-      for (let index = Math.max(0, count - 3); index < count; index += 1) {
+-        const text = (await turns.nth(index).innerText().catch(() => '')).replace(/\\s+/g, ' ').trim();
+-        if (text.includes(expected)) return true;
++      for (let i = Math.max(0, count - 3); i < count; i++) {
++        if (normalize(await turns.nth(i).innerText()).includes(normalize(prompt))) return true;
+       }
+       return false;
+     };
+-    const promptStillPresent = async () => {
+-      const freshComposer = page.locator('#prompt-textarea');
+-      if (await freshComposer.count() !== 1) return false;
+-      const current = await freshComposer.innerText().catch(() => '');
+-      return current.replace(/\\s+/g, ' ').trim().includes(expected);
+-    };
+-    const waitUntilAccepted = async () => {
+-      for (let i = 0; i < 20; i += 1) {
+-        if (await promptWasPosted()) return true;
+-        await page.waitForTimeout(250);
++    // Um único envio; em caso de dúvida, a retomada observa a conversa existente.
++    const byTestId = page.getByTestId('send-button').filter({ visible: true });
++    let send = await byTestId.count() === 1 ? byTestId : undefined;
++    if (!send) {
++      for (const label of ['Enviar', 'Enviar mensagem', 'Enviar prompt', 'Send prompt', 'Send message']) {
++        const candidate = page.getByRole('button', { name: label, exact: true }).filter({ visible: true });
++        if (await candidate.count() === 1) { send = candidate; break; }
+       }
+-      return false;
+-    };
+-    const sendOnce = async () => {
+-      let send = page.getByTestId('send-button');
+-      if (await send.count() !== 1) {
+-        for (const name of ['发送提示', 'Send prompt', 'Send message']) {
+-          const candidate = page.getByRole('button', { name, exact: true });
+-          if (await candidate.count() === 1) { send = candidate; break; }
+-        }
+-      }
+-      if (await send.count() === 1 && await send.isEnabled()) await send.click({ force: true });
+-      else await composer.press('Enter');
+-    };
+-    // Keyboard submission avoids the animated send button and follows the
+-    // composer's native form path.
+-    await composer.press('Enter');
+-    if (!await waitUntilAccepted()) {
+-      // A rejected UI click can transiently clear/rebuild the composer. Never
+-      // retry when the prompt is no longer visibly present: submission state
+-      // is then ambiguous and a retry could duplicate the request.
+-      if (!await promptStillPresent()) throw new Error('SUBMISSION_UNCERTAIN:prompt_disappeared_without_user_turn');
+-      await sendOnce();
+-      if (!await waitUntilAccepted()) throw new Error('UI_CHANGED:send_not_accepted');
+     }
+-    return { submitted: true, url: page.url() };
++    // Com anexos, o botão só habilita quando as fotos terminam de subir: espera em vez de apertar Enter cedo.
++    for (let i = 0; send && i < 120 && !(await send.isEnabled()); i++) await page.waitForTimeout(500);
++    if (send && await send.isEnabled()) await send.click({ force: true });
++    else await composer.press('Enter');
++    for (let i = 0; i < 40; i++) {
++      if (await accepted()) return { submitted: true, url: page.url() };
++      await page.waitForTimeout(250);
++    }
++    throw new Error('SUBMISSION_UNCERTAIN:user_turn_not_observed');
+   }`;
+ }
+ 
+@@ -376,58 +205,83 @@ export function deleteConversationScript(threadId: string): string {
+       if (openedPath === '/') return { deleted: true, alreadyDeleted: true, threadId, url: page.url() };
+       throw new Error('UI_CHANGED:managed_thread_not_open');
+     }
+-    const pickUniqueVisible = async (role, names) => {
+-      for (const name of names) {
+-        const candidate = page.getByRole(role, { name, exact: true }).filter({ visible: true });
+-        if (await candidate.count() === 1) return candidate;
++    // Primeiro o menu do título no topo (sempre da conversa aberta); se não houver, o “Ações do chat” da
++    // barra lateral, subindo a partir do link DESTA conversa até o bloco com um só link e um só botão.
++    const marked = await page.evaluate(threadId => {
++      const title = Array.from(document.querySelectorAll('header button[aria-haspopup="menu"]'))
++        .find(button => (button.innerText || '').trim() && button.getBoundingClientRect().width > 0);
++      if (title) {
++        title.setAttribute('data-hq-delete-target', threadId);
++        return 'topo';
+       }
+-      return undefined;
+-    };
+-    const options = await pickUniqueVisible('button', ['打开对话选项', 'Open conversation options']);
+-    if (!options) throw new Error('UI_CHANGED:conversation_options_missing');
++      const link = document.querySelector('nav a[href$="/c/' + threadId + '"]');
++      const isActions = button => /^(Ações do chat|Opções do chat|Open conversation options|打开对话选项)$/i
++        .test(button.getAttribute('aria-label') || '');
++      for (let node = link?.parentElement; node && node !== document.body; node = node.parentElement) {
++        const buttons = Array.from(node.querySelectorAll('button[aria-label]')).filter(isActions);
++        if (buttons.length === 1 && node.querySelectorAll('a[href*="/c/"]').length === 1) {
++          buttons[0].setAttribute('data-hq-delete-target', threadId);
++          return 'barra-lateral';
++        }
++        if (buttons.length > 1) break;
++      }
++      return '';
++    }, threadId);
++    if (!marked) throw new Error('UI_CHANGED:conversation_options_missing');
++    const options = page.locator('[data-hq-delete-target="' + threadId + '"]');
++    await options.scrollIntoViewIfNeeded().catch(() => {});
+     await options.click({ force: true });
+-    const remove = await pickUniqueVisible('menuitem', ['删除', 'Delete']);
+-    if (!remove) throw new Error('UI_CHANGED:delete_conversation_menu_item_missing');
++    let remove;
++    for (const name of ['Excluir', 'Delete', '删除']) {
++      const candidate = page.getByRole('menuitem', { name, exact: true }).filter({ visible: true });
++      if (await candidate.count() === 1) { remove = candidate; break; }
++    }
++    if (!remove) {
++      await page.keyboard.press('Escape');
++      throw new Error('UI_CHANGED:delete_conversation_menu_item_missing');
++    }
+     await remove.click({ force: true });
+-    const dialog = page.locator('[role="dialog"]').filter({ visible: true });
++    const dialog = page.locator('[role="dialog"], [role="alertdialog"]').filter({ visible: true });
++    await dialog.first().waitFor({ timeout: 5000 }).catch(() => {});
+     if (await dialog.count() !== 1) throw new Error('UI_CHANGED:delete_confirmation_missing');
+     let confirm;
+-    for (const name of ['删除', 'Delete']) {
++    for (const name of ['Excluir', 'Delete', '删除']) {
+       const candidate = dialog.getByRole('button', { name, exact: true });
+       if (await candidate.count() === 1) { confirm = candidate; break; }
+     }
+     if (!confirm) throw new Error('UI_CHANGED:delete_confirmation_button_missing');
+     await confirm.click({ force: true });
+     await page.waitForURL(url => url.pathname !== expectedPath, { timeout: 15000 });
+-    return { deleted: true, threadId, url: page.url() };
++    return { deleted: true, threadId, url: page.url(), via: marked };
+   }`;
+ }
+ 
+-export function downloadImageScript(
+-  turnId: string,
+-  image: PageImage,
+-): string {
++export function downloadImageScript(turnId: string, image: { src: string }): string {
+   return `async page => {
+-    const turnId = ${literal(turnId)};
+-    const source = ${literal(image.src)};
+-    const turn = page.locator('section[data-turn-id="' + turnId + '"]');
++    const turnId = ${JSON.stringify(turnId)};
++    const source = ${JSON.stringify(image.src)};
++    const turn = page.locator('section[data-turn-id="' + turnId + '"], [data-response-body="' + turnId + '"]');
+     if (await turn.count() !== 1) throw new Error('UI_CHANGED:assistant_turn_missing');
+-    const allImages = turn.locator('img');
+-    const imageCount = await allImages.count();
++    const images = turn.locator('img');
+     let selected;
+-    for (let index = 0; index < imageCount; index++) {
+-      const candidate = allImages.nth(index);
+-      if (await candidate.getAttribute('src') === source) { selected = candidate; break; }
++    for (let i = 0; i < await images.count(); i++) {
++      const candidate = images.nth(i);
++      if (await candidate.evaluate(img => img.currentSrc || img.src) === source) { selected = candidate; break; }
+     }
+     if (!selected) throw new Error('UI_CHANGED:generated_image_missing');
+-    const response = await page.request.get(source);
+-    if (!response.ok()) throw new Error('DOWNLOAD_FAILED:image_resource_http_' + response.status());
+-    const body = await response.body();
+-    return {
+-      source,
+-      contentType: response.headers()['content-type'] || '',
+-      bytes: body.length,
+-      base64: body.toString('base64')
+-    };
++    // URLs blob: pertencem ao documento; a requisição deve ocorrer no próprio navegador.
++    return await selected.evaluate(async image => {
++      const source = image.currentSrc || image.src;
++      const response = await fetch(source);
++      if (!response.ok) throw new Error('DOWNLOAD_FAILED:image_resource_http_' + response.status);
++      const blob = await response.blob();
++      const data = await new Promise((resolve, reject) => {
++        const reader = new FileReader();
++        reader.onload = () => resolve(reader.result);
++        reader.onerror = () => reject(new Error('DOWNLOAD_FAILED:image_read_failed'));
++        reader.readAsDataURL(blob);
++      });
++      return {source, contentType:blob.type, bytes:blob.size, base64:String(data).split(',')[1]};
++    });
+   }`;
+ }
+diff --git a/src/workflow.ts b/src/workflow.ts
+index 6a597d8..9fb139b 100644
+--- a/src/workflow.ts
++++ b/src/workflow.ts
+@@ -1,5 +1,6 @@
+ import { createHash } from "node:crypto";
+-import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises";
++import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
++import { tmpdir } from "node:os";
+ import path from "node:path";
+ import { getAppPaths, type AppPaths } from "./config.js";
+ import { PlaywrightCli, PlaywrightCliError } from "./browser/playwright-cli.js";
+@@ -9,8 +10,8 @@ import {
+   ensureChatModeScript,
+   downloadImageScript,
+   ensureImageModeScript,
++  attachImagesScript,
+   submitPromptScript,
+-  uploadReferenceImagesScript,
+ } from "./browser/scripts.js";
+ import { finalizeDownloadedImage } from "./image/inspect.js";
+ import { acquireLock } from "./state/lock.js";
+@@ -222,11 +223,7 @@ export class ChatGptImageWorkflow {
+           if (request.mode === "new") {
+             await this.browser.runCode(request.browser.session_name, ensureImageModeScript(), 30_000);
+           }
+-          await this.browser.runCode(
+-            request.browser.session_name,
+-            uploadReferenceImagesScript(request.reference_images),
+-            120_000,
+-          );
++          await this.uploadReferenceImages(request.browser.session_name, request.reference_images);
+           state = await this.collectState(request.browser.session_name);
+           record.baselineTurnIds = state.turns.map((turn) => turn.id);
+           record.threadId = state.threadId ?? record.threadId;
+@@ -367,8 +364,10 @@ export class ChatGptImageWorkflow {
+       const tabs = await this.browser.tabs(session);
+       const blank = tabs.find((tab) => tab.current && /^https:\/\/chatgpt\.com\/?(?:[?#].*)?$/.test(tab.url)) ??
+         [...tabs].reverse().find((tab) => /^https:\/\/chatgpt\.com\/?(?:[?#].*)?$/.test(tab.url));
+-      if (blank) {
+-        await this.browser.selectTab(session, blank.index);
++      // A extensão entrega uma aba about:blank ao conectar: usa ela em vez de abrir outra ao lado.
++      const empty = blank ?? tabs.find((tab) => tab.url === "about:blank" || tab.url === "");
++      if (empty) {
++        await this.browser.selectTab(session, empty.index);
+         await this.browser.goto(session, "https://chatgpt.com/");
+       } else {
+         await this.browser.newTab(session, "https://chatgpt.com/");
+@@ -378,6 +377,24 @@ export class ChatGptImageWorkflow {
+     await this.store.save(record);
+   }
+ 
++  private async uploadReferenceImages(sessionName: string, images: string[]): Promise<void> {
++    if (!images.length) return;
++    const files = await Promise.all(images.map(async (image) => ({
++      name: path.basename(image),
++      type: imageMimeType(image),
++      data: (await readFile(image)).toString("base64"),
++    })));
++    // O script carrega as fotos; fica numa pasta só do usuário e é apagado logo depois.
++    const folder = await mkdtemp(path.join(tmpdir(), "chatgpt-image-upload-"));
++    const script = path.join(folder, "upload.js");
++    try {
++      await writeFile(script, attachImagesScript(files), { mode: 0o600 });
++      await this.browser.runCodeFile(sessionName, script, 120_000);
++    } finally {
++      await rm(folder, { recursive: true, force: true });
++    }
++  }
++
+   private async collectState(sessionName: string): Promise<PageState> {
+     return await this.browser.runCode<PageState>(sessionName, collectPageStateScript(), 30_000);
+   }
+@@ -596,6 +613,11 @@ function errorMessage(error: unknown): string {
+   return error instanceof Error ? error.message : String(error);
+ }
+ 
++function imageMimeType(filename: string): string {
++  const extension = path.extname(filename).toLowerCase();
++  return { ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp", ".gif": "image/gif" }[extension] ?? "image/png";
++}
++
+ function delay(ms: number): Promise<void> {
+   return new Promise((resolve) => setTimeout(resolve, ms));
+ }
+diff --git a/tests/browser-scripts.test.ts b/tests/browser-scripts.test.ts
+index d237065..920206d 100644
+--- a/tests/browser-scripts.test.ts
++++ b/tests/browser-scripts.test.ts
+@@ -1,67 +1,67 @@
+-import { describe, expect, it } from "vitest";
+-import {
+-  collectPageStateScript,
+-  deleteConversationScript,
+-  ensureChatModeScript,
+-  ensureImageModeScript,
+-  submitPromptScript,
+-  uploadReferenceImagesScript,
+-  WORKED_FOR_PATTERN_SOURCE,
+-} from "../src/browser/scripts.js";
++import { describe, expect, it } from 'vitest';
++import { collectPageStateScript, deleteConversationScript, ensureChatModeScript,
++         ensureImageModeScript, submitPromptScript, attachImagesScript,
++         WORKED_FOR_PATTERN_SOURCE } from '../src/browser/scripts.js';
+ 
+-describe("browser scripts", () => {
+-  it("uses a bounded Worked for duration pattern", () => {
+-    const pattern = new RegExp(WORKED_FOR_PATTERN_SOURCE, "i");
+-    expect("Worked for 2m 6s Edit image".match(pattern)?.[0].trim()).toBe("Worked for 2m 6s");
+-    expect("Worked for 45 seconds Assistant prose".match(pattern)?.[0].trim()).toBe("Worked for 45 seconds");
+-    const script = collectPageStateScript();
+-    expect(script).toContain("data-message-author-role");
+-    expect(script).toContain("element.scrollIntoView");
+-    expect(script).not.toContain("scrollIntoViewIfNeeded");
+-  });
++function composerPage(draft = '', acknowledge = true) {
++  let text = draft, posted = false, sent = 0;
++  const visible = (value: any) => { value.filter = () => value; return value; };
++  const composer = visible({count: async () => 1, innerText: async () => text,
++    fill: async (value: string) => { text = value; }});
++  const page = {
++    locator: (selector: string) => selector.includes('data-turn="user"')
++      ? {count: async () => posted ? 1 : 0, nth: () => ({innerText: async () => text})} : composer,
++    getByTestId: () => visible({count: async () => 0}),
++    getByRole: (role: string, options: {name: string}) => visible({
++      count: async () => options.name === 'Enviar' ? 1 : 0, isEnabled: async () => true,
++      click: async () => { sent++; posted = acknowledge; }}),
++    waitForTimeout: async () => {}, url: () => 'https://chatgpt.com/c/test',
++  };
++  return {page, sent: () => sent, text: () => text};
++}
+ 
+-  it("fails closed when reference-image previews cannot be confirmed", () => {
+-    const script = uploadReferenceImagesScript(["C:/refs/one.png", "C:/refs/two.png"]);
+-    expect(script).toContain("UPLOAD_NOT_CONFIRMED:expected_");
+-    expect(script).not.toContain("return { uploaded: files.length, observed }");
+-    expect(script).toContain("previewCount >= attachmentsBefore + files.length");
+-  });
++const execute = (script: string, page: unknown) => (0, eval)('(' + script + ')')(page);
+ 
+-  it("supports the animated home-page image quick action", () => {
+-    const script = ensureImageModeScript();
+-    expect(script).toContain("'生成图片'");
+-    expect(script).toContain("activatedByQuickAction");
+-    expect(script).toContain("click({ force: true })");
++describe('browser scripts with current ChatGPT UI', () => {
++  it('keeps duration metadata bounded', () => {
++    const pattern = new RegExp(WORKED_FOR_PATTERN_SOURCE, 'i');
++    expect('Worked for 2m 6s Edit image'.match(pattern)?.[0].trim()).toBe('Worked for 2m 6s');
++    expect(collectPageStateScript()).toContain('data-user-message-bubble');
++    expect(collectPageStateScript()).toContain('data-response-body');
+   });
+-
+-  it("forces and verifies Chat mode before using image generation", () => {
+-    const script = ensureChatModeScript();
+-    expect(script).toContain("name: 'Chat'");
+-    expect(script).toContain("name: 'Work'");
+-    expect(script).toContain("await chat.click({ force: true })");
+-    expect(script).toContain("WORK_MODE_FORBIDDEN:chat_mode_required");
+-    expect(script).toContain("source: 'conversation_label'");
+-    expect(script).toContain("UI_CHANGED:chat_mode_not_confirmed");
++  it('requires every reference to be confirmed by name', () => {
++    const script = attachImagesScript([{ name: 'one.png', type: 'image/png', data: 'QUJD' }]);
++    expect(script).toContain('UPLOAD_NOT_CONFIRMED:expected_');
++    expect(script).toContain('one.png');
++    expect(script).not.toContain('blob:');
+   });
+-
+-  it("deletes only the already-open managed conversation with confirmation", () => {
+-    const script = deleteConversationScript("thread-one");
+-    expect(script).toContain("'/c/' + threadId");
+-    expect(script).toContain("managed_thread_not_open");
+-    expect(script).toContain("Open conversation options");
+-    expect(script).toContain("delete_confirmation_button_missing");
++  it('validates the composer without depending on a localized image shortcut', async () => {
++    const fixture = composerPage();
++    await expect(execute(ensureImageModeScript(), fixture.page)).resolves.toEqual({imageMode:true,activatedByPrompt:true});
++    expect(fixture.sent()).toBe(0);
+   });
+-
+-  it("places the caret after the image-mode pill and verifies prompt insertion", () => {
+-    const script = submitPromptScript("hello", true);
+-    expect(script).toContain("await composer.focus()");
+-    expect(script).toContain("await composer.press('End')");
+-    expect(script).toContain("UI_CHANGED:prompt_text_not_inserted");
+-    expect(script).toContain("promptStillPresent");
+-    expect(script).toContain("promptWasPosted");
+-    expect(script).toContain("await composer.press('Enter')");
+-    expect(script).toContain("send.click({ force: true })");
+-    expect(script).toContain("SUBMISSION_UNCERTAIN:prompt_disappeared_without_user_turn");
+-    expect(script).toContain("UI_CHANGED:send_not_accepted");
++  it('sends one message using the Portuguese send button', async () => {
++    const fixture = composerPage();
++    await expect(execute(submitPromptScript('Gere uma imagem', true), fixture.page)).resolves.toMatchObject({submitted:true});
++    expect(fixture.sent()).toBe(1);
++    expect(fixture.text()).toBe('Gere uma imagem');
++  });
++  it('preserves a draft already written by the user', async () => {
++    const fixture = composerPage('Meu rascunho');
++    await expect(execute(submitPromptScript('Novo pedido', true), fixture.page)).rejects.toThrow('existing_draft_preserved');
++    expect(fixture.text()).toBe('Meu rascunho');
++    expect(fixture.sent()).toBe(0);
++  });
++  it('does not resend when submission is uncertain', async () => {
++    const fixture = composerPage('', false);
++    await expect(execute(submitPromptScript('Gere uma imagem', true), fixture.page)).rejects.toThrow('SUBMISSION_UNCERTAIN');
++    expect(fixture.sent()).toBe(1);
++  });
++  it('requires Chat mode and rejects Work conversations', () => {
++    expect(ensureChatModeScript()).toContain('WORK_MODE_FORBIDDEN:chat_mode_required');
++  });
++  it('retains the restriction on deleting untracked conversations', () => {
++    expect(deleteConversationScript('test')).toContain('managed_thread_not_open');
++    expect(deleteConversationScript('test')).toContain('delete_confirmation_button_missing');
+   });
+ });

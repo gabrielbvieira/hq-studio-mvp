@@ -1,0 +1,3 @@
+# Opcional: "Gemini no navegador (experimental)". Biblioteca não oficial que usa a sua sessão do gemini.google.com.
+gemini-webapi==2.1.1
+browser-cookie3==0.20.1
