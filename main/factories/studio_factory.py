@@ -1,4 +1,4 @@
-"""Composição dos adaptadores concretos e casos de uso, como as factories do SOFT."""
+"""Composição dos adaptadores concretos e casos de uso do HQ Studio."""
 
 from dataclasses import dataclass
 from pathlib import Path

@@ -109,7 +109,7 @@ tests/                             # Comportamento e fronteiras de arquitetura
 data/                              # SQLite, fotos, imagens e estado das integrações
 ```
 
-Segue a estratégia do SOFT: controllers em `presentation`, operações em `application/use_cases`, adaptadores em `infra` e composição em `main/factories`. Os casos de uso dependem de contratos próprios, não de FastAPI, SQLite ou bibliotecas de IA. As factories escolhem as implementações. O servidor continua sendo FastAPI e os caminhos em `data/` continuam iguais.
+O HQ Studio organiza os controllers em `presentation`, as operações em `application/use_cases`, os adaptadores em `infra` e a composição em `main/factories`. Os casos de uso dependem de contratos próprios. As factories conectam as implementações de persistência, arquivos, exportação e geração de imagens. O servidor usa FastAPI e os dados locais ficam em `data/`.
 
 Veja [docs/architecture.md](docs/architecture.md) para localizar uma mudança e entender as fronteiras. Os testes de arquitetura impedem imports das camadas externas no domínio e nos casos de uso.
 

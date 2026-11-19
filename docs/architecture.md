@@ -1,6 +1,6 @@
 # Organização do código
 
-A referência é a estratégia do SOFT, observada em `presentation/controllers`, `application/use_cases`, `infra/repositories`, `infra/services` e `main/factories`. Por exemplo, o controller `ListAdBasedBlocksView` chama o caso de uso `ListAdBasedBlocks`, e `IntegratorFactory` escolhe adaptadores concretos. O HQ Studio mantém FastAPI e SQLite, com suas dependências montadas explicitamente pela factory.
+O HQ Studio separa a interface HTTP, os casos de uso, as regras de domínio e as integrações externas. Os controllers ficam em `presentation/controllers`, as operações em `application/use_cases` e os adaptadores em `infra`. As factories em `main/factories` conectam essas camadas. O servidor usa FastAPI e a persistência local usa SQLite.
 
 ## Fluxo de uma requisição
 
@@ -31,11 +31,11 @@ A referência é a estratégia do SOFT, observada em `presentation/controllers`,
 | Seleção das implementações concretas | `main/factories/studio_factory.py` |
 | Inicialização e ciclo de vida | `main/application.py` |
 
-## Limites da reorganização
+## Dados e dependências
 
-Não há migração de framework, de banco ou de formato de dados. `HQ_HOME` continua apontando para a raiz dos dados de execução e os arquivos estáticos vêm da raiz do código. SQLite, imagens, configurações de clientes e estado do navegador conservam os caminhos anteriores. O código das integrações e suas melhorias foram movidos com o comportamento preservado.
+`HQ_HOME` aponta para a raiz dos dados de execução, enquanto os arquivos estáticos vêm da raiz do código. O diretório `data/` armazena o banco SQLite, as imagens geradas e o estado das integrações com o navegador.
 
-Os contratos de entrada continuam usando Pydantic para manter a validação existente. Os casos de uso não importam FastAPI; a apresentação traduz suas falhas para HTTP. As operações foram agrupadas por responsabilidade, sem criar uma classe para cada CRUD nem copiar particularidades do Django.
+Os contratos de entrada usam Pydantic para validar os dados. Os casos de uso não importam FastAPI; a apresentação traduz suas falhas para HTTP. As operações são agrupadas por responsabilidade: gerenciamento do estúdio e geração de quadros.
 
 ## Validação
 
